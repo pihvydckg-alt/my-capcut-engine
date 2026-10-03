@@ -1,7 +1,11 @@
 {
-  "name": "capcut-engine",
-  "version": "1.1.0",
+  "name": "capcut-no-watermark-engine",
+  "version": "1.0.0",
   "type": "module",
-  "engines": { "node": ">=18" },
-  "scripts": { "start": "node server.js" }
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ffmpeg-static": "^5.2.0"
+  }
 }
