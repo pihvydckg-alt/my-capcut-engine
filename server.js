@@ -147,21 +147,31 @@ async function extractCapCut(raw) {
   };
 }
 
-// ডিবাগ: CapCut আসলে কী ফেরত দিচ্ছে তা দেখায়
+// ডিবাগ: CapCut পেজে কী কী ভিডিও-সদৃশ লিংক আছে তা দেখায়
 async function debugCapCut(raw) {
   const url = parseCapcutUrl(raw);
   const { status, html, finalUrl } = await fetchPage(url);
   const p = parsePage(html);
-  const topKeys = p.blobs[0] ? Object.keys(p.blobs[0]) : [];
+  const h = html.replace(/\\u002F/g, '/').replace(/\\\//g, '/');
+
+  const pairs = [];
+  const seen = new Set();
+  for (const m of h.matchAll(/"([A-Za-z_0-9]+)"\s*:\s*"(https?:\/\/[^"]+)"/g)) {
+    if (!/capcutcdn|\.mp4|video|play|origin|download|wm|watermark/i.test(m[1] + m[2])) continue;
+    if (/\.(jpe?g|png|webp|gif|svg|css|js)(\?|$)/i.test(m[2])) continue;
+    if (seen.has(m[2])) continue;
+    seen.add(m[2]);
+    pairs.push({ key: m[1], url: m[2].slice(0, 250) });
+  }
+
   return {
     status,
     finalUrl,
     htmlLength: html.length,
-    htmlStart: html.slice(0, 300),
     hasNextData: /__NEXT_DATA__/.test(html),
     jsonBlobs: p.blobs.length,
-    topKeys,
-    candidates: p.cands.slice(0, 10).map((c) => ({ score: c.sc, path: c.path, url: c.url.slice(0, 200) })),
+    topKeys: p.blobs[0] ? Object.keys(p.blobs[0]) : [],
+    videoLikeUrls: pairs.slice(0, 40),
   };
 }
 
