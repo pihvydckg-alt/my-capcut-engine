@@ -6,13 +6,12 @@ import net from 'net';
 const PORT = process.env.PORT || 3000;
 
 const BROWSER_HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   'Accept-Language': 'en-US,en;q=0.9',
   'Referer': 'https://www.capcut.com/',
 };
 
-const isCapcutHost = (h) => /(^|\.)capcut\.com$/i.test(h);
 const clean = (s) => (typeof s === 'string' ? s.replace(/\\u002F/g, '/').replace(/\\\//g, '/') : s);
 
 function isPrivateIp(ip) {
@@ -25,7 +24,7 @@ function isPrivateIp(ip) {
   return l === '::1' || l === '::' || l.startsWith('fc') || l.startsWith('fd') || l.startsWith('fe80') || l.startsWith('::ffff:');
 }
 
-// রিডাইরেক্ট ফলো করে মূল পেজ ও কনটেন্ট নিয়ে আসা
+// রিডাইরেক্ট ফলো করে মূল পেজ নিয়ে আসা
 function fetchCapCutPage(rawUrl, left = 6) {
   return new Promise((resolve, reject) => {
     if (left <= 0) return reject(new Error('অনেক বেশি রিডাইরেক্ট হয়েছে।'));
@@ -50,41 +49,83 @@ function fetchCapCutPage(rawUrl, left = 6) {
   });
 }
 
+// ওপেন রিভার্স সোর্স থেকে নো-ওয়াটারমার্ক ডিরেক্ট লিঙ্ক সংগ্রহের চেষ্টা
+async function fetchNoWatermarkUrl(url) {
+  return new Promise((resolve) => {
+    try {
+      const postData = JSON.stringify({ url });
+      const options = {
+        hostname: 'api.tikmate.app',
+        path: '/api/lookup',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(postData),
+          'User-Agent': 'Mozilla/5.0'
+        },
+        timeout: 5000
+      };
+
+      const req = https.request(options, (res) => {
+        let body = '';
+        res.on('data', chunk => body += chunk);
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(body);
+            if (parsed && (parsed.video_url || parsed.url)) {
+              return resolve(parsed.video_url || parsed.url);
+            }
+          } catch {}
+          resolve(null);
+        });
+      });
+      req.on('error', () => resolve(null));
+      req.write(postData);
+      req.end();
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
 // মূল টেমপ্লেট ডাটা এক্সট্র্যাক্ট করা
 async function extractCapCut(inputUrl) {
-  const { html, finalUrl } = await fetchCapCutPage(inputUrl);
+  // ১. প্রথমে নো-ওয়াটারমার্ক এন্ডপয়েন্টে চেষ্টা
+  const cleanVideo = await fetchNoWatermarkUrl(inputUrl);
+
+  const { html } = await fetchCapCutPage(inputUrl);
 
   let title = 'CapCut Video';
   let thumbnail = '';
-  let videoUrl = null;
+  let videoUrl = cleanVideo;
 
-  // ১. স্ক্রিপ্ট ট্যাগে থাকা আসল টেমপ্লেট ডাটা খোঁজা
+  // ২. স্ক্রিপ্ট ট্যাগে থাকা আসল টেমপ্লেট ডাটা
   const scriptMatches = html.match(/<script[^>]*>([\s\S]*?)<\/script>/gi) || [];
   for (const scriptTag of scriptMatches) {
-    if (scriptTag.includes('templateDetail') || scriptTag.includes('videoUrl')) {
+    if (scriptTag.includes('templateDetail')) {
       const cleanJson = scriptTag.replace(/<\/?script[^>]*>/gi, '').trim();
       try {
         const parsed = JSON.parse(cleanJson);
         const td = parsed?.loaderData?.['template-detail_$']?.templateDetail;
-        if (td && td.videoUrl && !td.videoUrl.includes('video_en2.mp4')) {
+        if (td) {
           title = td.title || title;
           thumbnail = td.coverUrl || '';
-          videoUrl = td.videoUrl;
+          if (!videoUrl && td.videoUrl && !td.videoUrl.includes('video_en2.mp4')) {
+            videoUrl = td.videoUrl;
+          }
           break;
         }
       } catch {}
     }
   }
 
-  // ২. ফলব্যাক: রেগুলার এক্সপ্রেশন দিয়ে আসল vod ভিডিও লিংক খোঁজা
+  // ৩. ফলব্যাক রেজেক্স
   if (!videoUrl) {
     const vodMatch = html.match(/"videoUrl"\s*:\s*"(https?:[^"]+capcutvod\.com[^"]+)"/);
-    if (vodMatch) {
-      videoUrl = clean(vodMatch[1]);
-    }
+    if (vodMatch) videoUrl = clean(vodMatch[1]);
   }
 
-  // ৩. টাইটেল ও থাম্বনেইল ফলব্যাক
+  // ৪. মেটাডাটা ফলব্যাক
   if (title === 'CapCut Video') {
     const tMatch = html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']*)["']/i);
     if (tMatch) title = tMatch[1];
@@ -95,7 +136,7 @@ async function extractCapCut(inputUrl) {
   }
 
   if (!videoUrl) {
-    throw new Error('আসল ভিডিও লিঙ্কটি পাওয়া যায়নি। লিংকটি পাবলিক কি না চেক করুন।');
+    throw new Error('ভিডিও লিঙ্কটি পাওয়া যায়নি। লিঙ্কটি পাবলিক কি না চেক করুন।');
   }
 
   return { title, thumbnail, videoUrl };
@@ -105,7 +146,7 @@ async function extractCapCut(inputUrl) {
 const HTML_FRONTEND = `<!DOCTYPE html>
 <html lang="bn"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CapCut Video Engine</title>
+<title>CapCut No-Watermark Downloader</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif}
 body{background:#0f172a;color:#f8fafc;display:flex;justify-content:center;min-height:100vh;padding:20px}
@@ -124,13 +165,13 @@ button:disabled{opacity:.6}
 .d{display:block;text-decoration:none;padding:12px;border-radius:8px;background:#10b981;color:#fff;font-weight:700;margin-top:8px}
 .d.alt{background:#475569}
 </style></head><body>
-<div class="c"><h1>CapCut Video Engine</h1><p class="s">আসল ভিডিও ডাউনলোডার</p>
+<div class="c"><h1>CapCut Video Engine</h1><p class="s">নো-ওয়াটারমার্ক ডাউনলোডার</p>
 <div class="b">
 <input id="u" placeholder="CapCut লিংক দিন...">
 <button id="go">ভিডিও খুঁজুন</button>
 <div id="l">প্রসেস হচ্ছে...</div><div id="e"></div>
 <div id="r"><img id="t" alt=""><h3 id="n"></h3>
-<a id="a" class="d" href="#">ডাউনলোড MP4</a>
+<a id="a" class="d" href="#">ডাউনলোড MP4 (ক্লিন)</a>
 <a id="a2" class="d alt" href="#" target="_blank" rel="noopener">সরাসরি লিংক</a></div>
 </div></div>
 <script>
@@ -176,7 +217,7 @@ const server = http.createServer(async (req, res) => {
       let target;
       try {
         target = new URL(u.searchParams.get('url'));
-        if (target.protocol !== 'https:') throw new Error();
+        if (target.protocol !== 'https:' && target.protocol !== 'http:') throw new Error();
         if (net.isIP(target.hostname)) throw new Error();
         const addrs = await dns.lookup(target.hostname, { all: true });
         if (!addrs.length || addrs.some((a) => isPrivateIp(a.address))) throw new Error();
@@ -185,15 +226,16 @@ const server = http.createServer(async (req, res) => {
         return res.end('অবৈধ ডাউনলোড লিংক।');
       }
 
-      const up = https.get(target.href, { headers: { Referer: 'https://www.capcut.com/', 'User-Agent': BROWSER_HEADERS['User-Agent'] } }, (r) => {
-        if (r.statusCode !== 200) {
+      const client = target.protocol === 'https:' ? https : http;
+      const up = client.get(target.href, { headers: { Referer: 'https://www.capcut.com/', 'User-Agent': BROWSER_HEADERS['User-Agent'] } }, (r) => {
+        if (r.statusCode !== 200 && r.statusCode !== 206) {
           r.resume();
           res.writeHead(502);
           return res.end(`ত্রুটি: HTTP ${r.statusCode}`);
         }
         res.writeHead(200, {
           'Content-Type': 'video/mp4',
-          'Content-Disposition': 'attachment; filename="capcut_video.mp4"',
+          'Content-Disposition': 'attachment; filename="capcut_no_watermark.mp4"',
           'Content-Length': r.headers['content-length'] || ''
         });
         r.pipe(res);
