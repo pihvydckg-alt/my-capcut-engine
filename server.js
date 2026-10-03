@@ -5,12 +5,9 @@ import net from 'net';
 
 const PORT = process.env.PORT || 3000;
 
-// র‍্যান্ডম ১৯ ডিজিটের ভার্চুয়াল ডিভাইস আইডি জেনারেটর
-const genDeviceId = () => '7' + Math.floor(Math.random() * 899999999999999999 + 100000000000000000);
-
-const MOBILE_HEADERS = {
-  'User-Agent': 'com.lemon.lvoverseas/19.7.0 (Linux; U; Android 13; en_US; Pixel 7 Pro; Build/TQ3A.230901.001; Cronet/TTNetVersion:53f40d39)',
-  'Accept': 'application/json',
+const BROWSER_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   'Accept-Language': 'en-US,en;q=0.9',
   'Referer': 'https://www.capcut.com/',
 };
@@ -28,78 +25,83 @@ function isPrivateIp(ip) {
   return l === '::1' || l === '::' || l.startsWith('fc') || l.startsWith('fd') || l.startsWith('fe80') || l.startsWith('::ffff:');
 }
 
-// ১. শেয়ার লিংক থেকে রিডাইরেক্ট করে মূল Template ID বের করা
-function resolveTemplateId(rawUrl, left = 6) {
+// রিডাইরেক্ট ফলো করে মূল পেজ ও কনটেন্ট নিয়ে আসা
+function fetchCapCutPage(rawUrl, left = 6) {
   return new Promise((resolve, reject) => {
     if (left <= 0) return reject(new Error('অনেক বেশি রিডাইরেক্ট হয়েছে।'));
-    
+
     let u = rawUrl.trim();
     if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
 
     const client = u.startsWith('https:') ? https : http;
-    const req = client.get(u, { headers: { 'User-Agent': MOBILE_HEADERS['User-Agent'] } }, (res) => {
+    const req = client.get(u, { headers: BROWSER_HEADERS }, (res) => {
       if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
         res.resume();
         const next = new URL(res.headers.location, u).href;
-        return resolve(resolveTemplateId(next, left - 1));
+        return resolve(fetchCapCutPage(next, left - 1));
       }
 
-      const idMatch = u.match(/template-detail\/(\d+)/i) || u.match(/template_id=(\d+)/i);
-      const tid = idMatch ? idMatch[1] : null;
-      resolve({ tid, finalUrl: u });
-    });
-    req.on('error', reject);
-    req.setTimeout(15000, () => req.destroy(new Error('CapCut লিংক রেসপন্স করছে না।')));
-  });
-}
-
-// ২. CapCut মোবাইল API গেটওয়ে কল করা
-function fetchMobileApi(templateId) {
-  return new Promise((resolve, reject) => {
-    const deviceId = genDeviceId();
-    const apiUrl = `https://www.capcut.com/luckycat/i18n/capcut/thirdpatry_share/v1/landing_page/template_detail_v2?template_id=${templateId}&aid=2928&device_id=${deviceId}&iid=${deviceId}&app_version=19.7.0&os_version=13&device_platform=android`;
-
-    https.get(apiUrl, { headers: MOBILE_HEADERS }, (res) => {
       let chunks = '';
       res.on('data', (c) => chunks += c);
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(chunks);
-          resolve(json);
-        } catch {
-          reject(new Error('API থেকে সঠিক JSON পাওয়া যায়নি।'));
-        }
-      });
-    }).on('error', reject);
+      res.on('end', () => resolve({ html: chunks, finalUrl: u }));
+    });
+    req.on('error', reject);
+    req.setTimeout(15000, () => req.destroy(new Error('CapCut সার্ভার থেকে রেসপন্স আসেনি।')));
   });
 }
 
-// ৩. রেজলভ ইঞ্জিন (মোবাইল API ডেটা পার্সিং)
+// মূল টেমপ্লেট ডাটা এক্সট্র্যাক্ট করা
 async function extractCapCut(inputUrl) {
-  const { tid, finalUrl } = await resolveTemplateId(inputUrl);
+  const { html, finalUrl } = await fetchCapCutPage(inputUrl);
 
-  if (!tid) {
-    throw new Error('CapCut Template ID শনাক্ত করা যায়নি। সঠিক লিংক দিন।');
+  let title = 'CapCut Video';
+  let thumbnail = '';
+  let videoUrl = null;
+
+  // ১. স্ক্রিপ্ট ট্যাগে থাকা আসল টেমপ্লেট ডাটা খোঁজা
+  const scriptMatches = html.match(/<script[^>]*>([\s\S]*?)<\/script>/gi) || [];
+  for (const scriptTag of scriptMatches) {
+    if (scriptTag.includes('templateDetail') || scriptTag.includes('videoUrl')) {
+      const cleanJson = scriptTag.replace(/<\/?script[^>]*>/gi, '').trim();
+      try {
+        const parsed = JSON.parse(cleanJson);
+        const td = parsed?.loaderData?.['template-detail_$']?.templateDetail;
+        if (td && td.videoUrl && !td.videoUrl.includes('video_en2.mp4')) {
+          title = td.title || title;
+          thumbnail = td.coverUrl || '';
+          videoUrl = td.videoUrl;
+          break;
+        }
+      } catch {}
+    }
   }
 
-  const apiRes = await fetchMobileApi(tid);
-  const detail = apiRes?.data?.template_detail;
-
-  if (!detail || !detail.videoUrl) {
-    throw new Error('ক্যাপকাট সার্ভার থেকে ভিডিও লিংক পাওয়া যায়নি।');
+  // ২. ফলব্যাক: রেগুলার এক্সপ্রেশন দিয়ে আসল vod ভিডিও লিংক খোঁজা
+  if (!videoUrl) {
+    const vodMatch = html.match(/"videoUrl"\s*:\s*"(https?:[^"]+capcutvod\.com[^"]+)"/);
+    if (vodMatch) {
+      videoUrl = clean(vodMatch[1]);
+    }
   }
 
-  return {
-    title: detail.title || 'CapCut Template Video',
-    thumbnail: detail.coverUrl || '',
-    videoUrl: detail.videoUrl,
-    author: detail.author?.name || 'Unknown',
-    width: detail.videoWidth || null,
-    height: detail.videoHeight || null
-  };
+  // ৩. টাইটেল ও থাম্বনেইল ফলব্যাক
+  if (title === 'CapCut Video') {
+    const tMatch = html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']*)["']/i);
+    if (tMatch) title = tMatch[1];
+  }
+  if (!thumbnail) {
+    const imgMatch = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']*)["']/i);
+    if (imgMatch) thumbnail = clean(imgMatch[1]);
+  }
+
+  if (!videoUrl) {
+    throw new Error('আসল ভিডিও লিঙ্কটি পাওয়া যায়নি। লিংকটি পাবলিক কি না চেক করুন।');
+  }
+
+  return { title, thumbnail, videoUrl };
 }
 
-// ৪. ওয়েব ফ্রন্টএন্ড UI
+// ফ্রন্টএন্ড UI
 const HTML_FRONTEND = `<!DOCTYPE html>
 <html lang="bn"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -122,14 +124,14 @@ button:disabled{opacity:.6}
 .d{display:block;text-decoration:none;padding:12px;border-radius:8px;background:#10b981;color:#fff;font-weight:700;margin-top:8px}
 .d.alt{background:#475569}
 </style></head><body>
-<div class="c"><h1>CapCut Video Engine</h1><p class="s">মোবাইল API চালিত ফাস্ট ডাউনলোডার</p>
+<div class="c"><h1>CapCut Video Engine</h1><p class="s">আসল ভিডিও ডাউনলোডার</p>
 <div class="b">
 <input id="u" placeholder="CapCut লিংক দিন...">
 <button id="go">ভিডিও খুঁজুন</button>
 <div id="l">প্রসেস হচ্ছে...</div><div id="e"></div>
 <div id="r"><img id="t" alt=""><h3 id="n"></h3>
 <a id="a" class="d" href="#">ডাউনলোড MP4</a>
-<a id="a2" class="d alt" href="#" target="_blank" rel="noopener">সরাসরি CDN লিংক</a></div>
+<a id="a2" class="d alt" href="#" target="_blank" rel="noopener">সরাসরি লিংক</a></div>
 </div></div>
 <script>
 const $=id=>document.getElementById(id);
@@ -149,7 +151,7 @@ $('go').onclick=async()=>{
 };
 </script></body></html>`;
 
-// ৫. মূল সার্ভার হ্যান্ডলার
+// সার্ভার রাউটিং
 const server = http.createServer(async (req, res) => {
   try {
     const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -180,17 +182,17 @@ const server = http.createServer(async (req, res) => {
         if (!addrs.length || addrs.some((a) => isPrivateIp(a.address))) throw new Error();
       } catch {
         res.writeHead(400);
-        return res.end('অবৈধ বা নিষিদ্ধ ডাউনলোড URL।');
+        return res.end('অবৈধ ডাউনলোড লিংক।');
       }
 
-      const up = https.get(target.href, { headers: { Referer: 'https://www.capcut.com/', 'User-Agent': MOBILE_HEADERS['User-Agent'] } }, (r) => {
+      const up = https.get(target.href, { headers: { Referer: 'https://www.capcut.com/', 'User-Agent': BROWSER_HEADERS['User-Agent'] } }, (r) => {
         if (r.statusCode !== 200) {
           r.resume();
           res.writeHead(502);
-          return res.end(`আপস্ট্রিম ত্রুটি: HTTP ${r.statusCode}`);
+          return res.end(`ত্রুটি: HTTP ${r.statusCode}`);
         }
         res.writeHead(200, {
-          'Content-Type': r.headers['content-type'] || 'video/mp4',
+          'Content-Type': 'video/mp4',
           'Content-Disposition': 'attachment; filename="capcut_video.mp4"',
           'Content-Length': r.headers['content-length'] || ''
         });
